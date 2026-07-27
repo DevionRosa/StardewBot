@@ -1,0 +1,89 @@
+# ---------- Python bytecode / caches ----------
+__pycache__/
+*.py[cod]
+*.so
+
+# ---------- Virtual environments ----------
+.venv/
+venv/
+ENV/
+env/
+
+# ---------- Distribution / packaging ----------
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ---------- Test / tooling caches ----------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- Secrets / local config ----------
+# Track .env.example as the template; never commit real .env files.
+.env
+.env.local
+.env.*.local
+
+# ---------- Editor / OS junk ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Windows / patch artefacts ----------
+# Project is Windows-first (pywin32 / SAPI5 / pyttsx3); ignore patch leftovers.
+*.lnk
+*.orig
+*.bak
+*.rej
+
+# ---------- Regeneratable build artifacts ----------
+# Recreated by `python scripts/build_wiki_corpus.py` (~10–15 min, ~100 MB).
+data/stardew_wiki_cache.sqlite
+
+# ---------- Large pre-trained models ----------
+# Download separately per README:
+#   https://alphacephei.com/vosk/models -> unpack into models/vosk-model-<lang>/
+models/vosk-model-*/
+
+# Keep the source archives out too — only the unpacked dir is needed.
+models/*.zip
+models/*.tar.gz
+models/*.tgz
+
+# ---------- Stray / duplicate assets ----------
+# Canonical wake-word model lives at models/hey_farmer.onnx (see src/config.py).
+# Keep the root-level copy out of the repo entirely.
+hey_farmer.tflite
+
+# ---------- Runtime / captured artefacts ----------
+# Voice assistant captures audio (src/audio.py) and synthesises TTS (src/tts.py);
+# these are generated locally and almost never belong in version control.
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
+*.m4a
+
+# Logs (app output, TTS errors, capture progress, etc.).
+*.log
+logs/
+
+# Run-time caches (e.g. transcribe scratch, fuzzy-correction temp dumps).
+.cache/
+
+# Process / crash artefacts left behind by a previous bad run.
+*.pid
+*.dump
+core
+core.*
