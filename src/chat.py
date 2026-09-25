@@ -16,6 +16,7 @@ is the price of admission for high factual accuracy.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import List, Optional
@@ -144,10 +145,6 @@ def _is_stardew_mention(question: str, vocab: set[str]) -> bool:
     return any(keyword in lowered for keyword in _RESERVED_KEYWORDS)
 
 
-def is_stardew_question(question: str) -> bool:
-    return bool(get_wiki_context(question, limit=1))
-
-
 # ----------------------------------------------------------- answer tiers ---
 
 def fallback_response() -> str:
@@ -219,7 +216,7 @@ def _available_body_text(entity: StardewEntity, index) -> str:
 
 # --------------------------------------------------------------- main API ---
 
-def answer_question(question: str) -> str:
+def _answer_question(question: str) -> str:
     """Return the best available answer for ``question``."""
     if not question.strip():
         return fallback_response()
@@ -242,7 +239,7 @@ def answer_question(question: str) -> str:
 
     # Single guard: refuse off-topic + corpus-empty, off-topic + corpus-empty
     # is the only path where the upstream user has nothing useful to hear.
-    if corpus_empty and not _is_stardew_mention(question, set()):
+    if corpus_empty and not _is_stardew_mention(question, corpus_vocab):
         return fallback_response()
 
     if corpus_empty:
@@ -332,13 +329,13 @@ def _strict_rephrase(
         return answer
 
     # Safety net: never let a wiki dump reach the TTS pipeline.
-    if wiki_context:
-        snippet = answer_from_wiki(question, limit=1)
-        if snippet and len(snippet) <= 300:
-            return snippet
     if body_text:
         snippet = _safe_sentence(body_text, max_chars=240)
         if snippet:
+            return snippet
+    if wiki_context:
+        snippet = answer_from_wiki(question, limit=1)
+        if snippet and len(snippet) <= 300:
             return snippet
     return "I don't have that information in the wiki."
 
@@ -359,3 +356,18 @@ def _freeform(question: str) -> str:
     except Exception as exc:
         print(f"[Chat] Free-form fallback failed: {exc}")
         return "I couldn't reach the local LLM. Make sure Ollama is running on http://localhost:11434."
+
+
+_ANSWER_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f\ufffd]")
+
+
+def answer_question(question: str) -> str:
+    """Sanitised entry point — every tier's output passes through here.
+
+    LLM output (and occasionally wiki text) can contain control characters
+    or U+FFFD mojibake that corrupt TTS, log files, and console printing;
+    strip them and collapse whitespace before the answer reaches the
+    speaker.
+    """
+    text = _answer_question(question)
+    return " ".join(_ANSWER_CONTROL_RE.sub(" ", text or "").split())

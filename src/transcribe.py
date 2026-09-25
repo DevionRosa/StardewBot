@@ -18,6 +18,7 @@ from typing import Dict
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 from .config import SAMPLE_RATE, VOSK_MODEL_DIR
+from ._transcribe_distance import levenshtein as _levenshtein
 
 SetLogLevel(-1)
 
@@ -39,36 +40,27 @@ _vocab_loaded: bool = False
 _vocab_lock = threading.Lock()
 
 # Single-letter / stop tokens we never want to "correct" into something else.
+#
+# The second block is critical: game entities like "Wheat" live in the wiki
+# vocabulary, and without these protections the fuzzy corrector happily
+# rewrote question words into them — "where can I find" → "wheat can I find"
+# (2 edits, same first letter) on EVERY question. Common words Vosk already
+# transcribes reliably must never be fuzzy-matched away.
 _PROTECTED_TOKENS = {
     "i", "a", "an", "the", "to", "of", "and", "or", "my", "in", "on", "at",
     "for", "be", "is", "it", "you", "we", "do", "so", "as", "if",
     "can", "yes", "no", "not", "but", "or", "if", "by", "an", "or",
+    # Question words and common verbs/modals.
+    "where", "what", "when", "who", "whose", "why", "how", "which", "whats",
+    "there", "their", "they", "them", "then", "than", "that", "this",
+    "these", "those", "with", "will", "shall", "would", "could", "should",
+    "might", "must", "have", "been", "being", "about", "after", "again",
+    "tell", "give", "show", "make", "need", "want", "know", "does", "did",
+    "get", "got", "use", "sell", "buy", "best", "good", "much", "many",
+    "more", "most", "some", "such", "only", "also", "very", "just", "like",
 }
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z']*")
-
-
-def _levenshtein(a: str, b: str) -> int:
-    """Pure-Python Levenshtein distance — fine for short tokens."""
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        current = [i]
-        for j, cb in enumerate(b, 1):
-            current.append(
-                min(
-                    current[j - 1] + 1,            # insertion
-                    prev[j] + 1,                   # deletion
-                    prev[j - 1] + (ca != cb),      # substitution
-                )
-            )
-        prev = current
-    return prev[-1]
 
 
 def _ensure_vocabulary_loaded() -> Dict[str, str]:

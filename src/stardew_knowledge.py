@@ -3,6 +3,16 @@ Curated Stardew Valley knowledge base with retrieval.
 Provides factual context to the LLM to reduce hallucinations.
 """
 
+# Words that carry no topic signal for fact matching. Without this list the
+# generic word "fish" matched every fact that mentions any fish, and question
+# words (where/when/what) matched nearly everything.
+_FACT_STOPWORDS = {
+    "fish", "fishes", "fishing", "catch", "caught", "get", "find", "found",
+    "where", "when", "what", "how", "who", "the", "and", "can", "you",
+    "farm", "farming", "game", "stardew", "valley", "use", "using", "make",
+    "made", "grow", "grown", "does", "are", "for", "with", "from", "into",
+}
+
 STARDEW_FACTS = {
     "coal": [
         "Coal is found in the Mines starting at floor 41 and deeper.",
@@ -77,12 +87,15 @@ STARDEW_FACTS = {
         "Iridium ore is on floors 81-120.",
         "Take stairs down, avoid or defeat monsters.",
     ],
+    # One fact per species so per-fact matching never mixes them up. Values
+    # cross-checked against the wiki infoboxes (Location/Season/Time/Weather).
     "fishing": [
-        "Pike is a fish that can be caught in the river in Pelican Town or Cindersap Forest and in the pond in Cindersap Forest.",
+        "Bullhead is found in the Mountain Lake, in any season, any weather, and any time of day.",
+        "Flounder is found in the Ocean and on Ginger Island, during Spring and Summer, from 6am to 8pm, in any weather.",
+        "Pike can be caught in the river in Pelican Town or Cindersap Forest and in the pond in Cindersap Forest.",
         "Pike can also be caught on Riverland Farm and in the large pond on Forest Farm.",
         "Pike can be caught in Summer and Winter.",
         "Pike can be caught at any time of day and in any weather.",
-        "Pike is a River fish and a Pond fish.",
     ],
     "quality": [
         "Crop quality levels: Regular, Silver, and Gold.",
@@ -96,22 +109,37 @@ def retrieve_stardew_facts(query: str, max_results: int = 3) -> str:
     """
     Retrieve relevant Stardew facts based on query keywords.
     Returns formatted context string to inject into LLM prompt.
+
+    Matching is per-fact: a fact is included only when it shares a content
+    token with the query. Topic-level matching (the old behaviour) pulled in
+    every sibling fact, so a Pike-only "fishing" topic hijacked all fishing
+    questions. Stopwords and generic words (fish, catch, farm, where, when)
+    are ignored so facts are chosen by their distinctive content only.
     """
     query_lower = query.lower()
-    query_tokens = {token for token in ''.join(ch if ch.isalnum() else ' ' for ch in query_lower).split() if token}
-    scored_facts = []
+    query_tokens = {
+        token
+        for token in ''.join(ch if ch.isalnum() else ' ' for ch in query_lower).split()
+        if len(token) > 2 and token not in _FACT_STOPWORDS
+    }
+    if not query_tokens:
+        return ""
 
+    scored_facts: list[tuple[int, str, str]] = []
     for topic, facts in STARDEW_FACTS.items():
-        topic_text = f"{topic} {' '.join(facts)}".lower()
-        topic_tokens = {token for token in ''.join(ch if ch.isalnum() else ' ' for ch in topic_text).split() if token}
-        overlap = len(query_tokens & topic_tokens)
-        if overlap > 0:
-            for fact in facts:
+        for fact in facts:
+            fact_tokens = {
+                token
+                for token in ''.join(ch if ch.isalnum() else ' ' for ch in fact.lower()).split()
+                if len(token) > 2 and token not in _FACT_STOPWORDS
+            }
+            overlap = len(query_tokens & fact_tokens)
+            if overlap > 0:
                 scored_facts.append((overlap, topic, fact))
 
     if not scored_facts:
         return ""
-    
+
     # Return top facts as context, preferring the strongest overlap.
     scored_facts.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
     context_lines = [f"**{topic}**: {fact}" for _, topic, fact in scored_facts[:max_results]]
@@ -136,6 +164,8 @@ Stardew Valley facts:
 - Fertilizer placement timing matters: apply BEFORE planting.
 - NPCs have specific preferences - check their loved/liked/disliked gifts.
 - Mining requires proper tools and floor progression.
+- Fish live in specific locations (river, ocean, lake, mountain, swamp)
+  and are only catchable in certain seasons, times, and weather.
 - Quality crops sell for significantly more money.
 
 When answering:

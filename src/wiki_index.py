@@ -41,28 +41,43 @@ WIKI_BASE_URL = "https://stardewvalleywiki.com"
 CACHE_DIR = BASE_DIR / "data"
 CACHE_DB_PATH = CACHE_DIR / "stardew_wiki_cache.sqlite"
 SEARCH_LIMIT = 5
-MAX_EXTRACT_CHARS = 5000
+MAX_EXTRACT_CHARS = 12000
 
 STOPWORDS = {
-    "a", "about", "after", "all", "an", "and", "any", "are", "at", "be", "can", "do",
-    "does", "for", "from", "get", "have", "how", "i", "in", "is", "it", "me", "my",
+    "a", "about", "after", "all", "an", "and", "any", "are", "at", "be", "can", "catch", "do",
+    "does", "find", "for", "from", "get", "have", "how", "i", "in", "is", "it", "me", "my",
     "of", "on", "or", "should", "tell", "the", "their", "them", "there", "this", "to",
     "what", "when", "where", "which", "who", "why", "with", "you", "your",
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 TAG_RE = re.compile(r"<[^>]+>")
+# Sortable-table values embed a hidden "data-sort-value=\"15\">" prefix in
+# their text; strip it so prices read "15g", not "data-sort-value=\"15\"> 15g".
+_DATA_SORT_RE = re.compile(r'data-sort-value=\\?"[^\\"]*\\?">?')
 
 # Wiki infobox kind detection cues. Keep aligned with scripts/build_wiki_corpus.py.
+#
+# Cues are ordered from most to least distinctive because detection returns
+# on the FIRST matching cue and kinds are iterated in dict order. Generic
+# fields like "Sell Price" or "Season" appear on both crop and fish infoboxes
+# and previously caused fish pages to classify as crops.
 KIND_INFOCUES: dict[str, tuple[str, ...]] = {
-    "crop": ("Growth Time", "Regrowth", "Seed", "Sell Price", "Season"),
-    "fish": ("Time", "Location", "Weather", "Difficulty", "Behavior"),
-    "npc": ("Birthday", "Lives In", "Address", "Marriage"),
-    "location": ("Inhabitants", "Features", "Open Hours"),
-    "bundle": ("Bundles", "Reward", "Requirements"),
-    "tool": ("Material", "Upgrades", "Uses"),
-    "monster": ("HP", "Damage", "Defense", "Drops"),
+    "crop": ("Growth Time", "Regrowth"),
+    "fish": ("Difficulty", "Behavior", "Fishing XP"),
+    "npc": ("Birthday", "Lives In", "Marriage", "Favorite Gift"),
+    "location": ("Open Hours", "Closed", "Inhabitants"),
+    "bundle": ("Bundles", "Required Items", "Gold Reward"),
+    "tool": ("Upgrades", "Materials"),
+    "monster": ("HP", "Damage", "Drops"),
 }
+
+# Real fish pages carry categories like "Pond fish", "Lake fish", "River fish",
+# "Ocean fish", "Island fish". Fishing *equipment* pages carry categories like
+# "Fishing Poles", "Fish Tanks", "Fishing Tackle" — those also START with
+# "fish", which is exactly why a naive startswith() check miscategorised rods
+# and tanks as fish. Full-match on "(<word> )?fish" keeps them apart.
+_FISH_CATEGORY_RE = re.compile(r"^(?:[a-z0-9]+ )?fish$")
 
 # Mapping from common intent verbs to structured fields, used by ``compose_answer``.
 INTENT_FIELDS: dict[str, tuple[str, ...]] = {
@@ -120,6 +135,12 @@ class StardewWikiIndex:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
+        # The builder script writes to this DB while the assistant runs;
+        # wait out transient locks instead of raising "database is locked".
+        try:
+            self.connection.execute("PRAGMA busy_timeout = 10000")
+        except sqlite3.Error:
+            pass
         self._init_schema()
 
     def close(self) -> None:
@@ -146,6 +167,7 @@ class StardewWikiIndex:
         )
 
         StardewWikiIndex._init_extended_schema(self.connection)
+        self._ensure_fts_populated()
         self.connection.commit()
 
     @staticmethod
@@ -212,6 +234,84 @@ class StardewWikiIndex:
             )
         except sqlite3.OperationalError:
             pass
+        # Body-text FTS mirror over ``stardew_page_clean`` — powers the
+        # structured RAG path so questions fall back to real wiki text from
+        # the 2,000-page corpus instead of a near-empty legacy cache.
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS stardew_page_clean_fts USING fts5(
+                    title, body_text,
+                    content='', tokenize='porter unicode61'
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
+    def rebuild_page_fts(connection: sqlite3.Connection) -> int:
+        """Rebuild the body-text FTS mirror from ``stardew_page_clean``.
+
+        The mirror is content-less (``content=''``), so rows must be inserted
+        explicitly with the source table's rowid. Rebuilds are cheap (~2k
+        rows) and keep the mirror consistent after corpus (re)builds.
+
+        Returns the number of rows indexed and records it in
+        ``stardew_corpus_meta`` — contentless FTS5 tables report COUNT(*) as
+        0, so the flag is the only reliable population signal.
+        """
+        try:
+            # The mirror copies the source table 1:1 by rowid, so the source
+            # count after the insert is the indexed count. (cursor.rowcount
+            # is unreliable for INSERT...SELECT in Python's sqlite3.)
+            # Contentless FTS5 tables reject plain ``DELETE FROM``; the
+            # special 'delete-all' command is the supported way to clear one.
+            connection.execute(
+                "INSERT INTO stardew_page_clean_fts(stardew_page_clean_fts) VALUES('delete-all')"
+            )
+            connection.execute(
+                """
+                INSERT INTO stardew_page_clean_fts(rowid, title, body_text)
+                SELECT rowid, title, body_text FROM stardew_page_clean
+                """
+            )
+            inserted = int(
+                connection.execute("SELECT COUNT(*) FROM stardew_page_clean").fetchone()[0]
+            )
+            connection.commit()
+            connection.execute(
+                "INSERT INTO stardew_corpus_meta(key, value) VALUES('fts_row_count', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(inserted),),
+            )
+            connection.commit()
+            return inserted
+        except sqlite3.OperationalError:
+            # FTS5 unavailable — structured RAG silently degrades to legacy.
+            return 0
+
+    def _ensure_fts_populated(self) -> None:
+        """Self-heal the FTS mirror if the corpus outran it.
+
+        Covers DBs built before the mirror existed or partially rebuilt:
+        when the recorded mirror row count lags the source table, rebuild
+        once at startup (~a second for the full corpus) instead of answering
+        from an empty index forever.
+        """
+        try:
+            source = self.connection.execute(
+                "SELECT COUNT(*) FROM stardew_page_clean"
+            ).fetchone()[0]
+            flag_row = self.connection.execute(
+                "SELECT value FROM stardew_corpus_meta WHERE key = 'fts_row_count'"
+            ).fetchone()
+            mirror_count = int(flag_row[0]) if flag_row and flag_row[0] else -1
+            if mirror_count < source:
+                rebuilt = self.rebuild_page_fts(self.connection)
+                print(f"[Wiki] Rebuilt page FTS mirror: {rebuilt} rows")
+        except (sqlite3.OperationalError, ValueError):
+            pass
 
     # ------------------------------------------------------------ helpers ---
 
@@ -257,28 +357,46 @@ class StardewWikiIndex:
 
     @staticmethod
     def _extract_infobox(html_text: str) -> dict[str, str]:
+        """Parse the wiki infobox.
+
+        The Stardew Valley wiki's infobox is ``<table id="infoboxtable">`` and
+        marks keys with ``<td id="infoboxsection">`` and values with
+        ``<td id="infoboxdetail">`` — it uses NO ``infobox`` class and NO
+        ``th`` keys. Generic MediaWiki infoboxes (``class="infobox"`` with
+        ``th``/``td``) are still supported as a fallback so both layouts parse.
+        """
         if not _BS4_AVAILABLE:
             # Without BeautifulSoup we cannot reliably parse infobox tables,
             # so return empty rather than risk garbage extraction.
             return {}
         soup = BeautifulSoup(html_text, "html.parser")  # type: ignore[misc]
-        table = soup.find(
-            "table",
-            class_=lambda cls: bool(cls) and "infobox" in (cls if isinstance(cls, list) else [cls]),
-        )
+        table = soup.find("table", id="infoboxtable")
+        if table is None:
+            table = soup.find(
+                "table",
+                class_=lambda cls: bool(cls) and "infobox" in (cls if isinstance(cls, list) else [cls]),
+            )
         if table is None:
             return {}
         fields: dict[str, str] = {}
         for row in table.find_all("tr"):
-            header = row.find("th")
-            cell = row.find("td")
-            if header is None or cell is None:
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                # Title/image/description rows span the table — not key/value.
+                continue
+            header = cells[0]
+            if header.name == "td" and header.get("id") != "infoboxsection":
+                # First cell is a td but not a section key (e.g. colspan rows).
                 continue
             key = header.get_text(" ", strip=True)
             if not key:
                 continue
-            value = cell.get_text(" ", strip=True)
-            fields[key] = value or cell.get("title") or ""
+            value_cell = row.find("td", id="infoboxdetail") or cells[-1]
+            if value_cell is header:
+                continue
+            value = value_cell.get_text(" ", strip=True)
+            value = " ".join(_DATA_SORT_RE.sub(" ", value).split())
+            fields[key] = value or value_cell.get("title") or ""
         return {key: " ".join(value.split()) for key, value in fields.items()}
 
     @staticmethod
@@ -291,9 +409,13 @@ class StardewWikiIndex:
                 for cue in cues:
                     if cue in infobox:
                         return kind
+        # Fish categories need a full match so "Fishing Poles" and "Fish
+        # Tanks" (equipment) never match, while "Pond fish" and "Lake fish"
+        # always do.
+        if any(_FISH_CATEGORY_RE.match(c) for c in categories_lower):
+            return "fish"
         for kind, prefix in (
             ("crop", "crops"),
-            ("fish", "fish"),
             ("npc", "villagers"),
             ("npc", "marriageable"),
             ("location", "locations"),
@@ -395,7 +517,10 @@ class StardewWikiIndex:
 
         extract = self._html_to_text(html_text)
         if len(extract) > MAX_EXTRACT_CHARS:
-            extract = extract[:MAX_EXTRACT_CHARS].rsplit(" ", 1)[0].strip() + "..."
+            # Slice generously past the limit, then trim to the last complete
+            # sentence so the stored extract ends on a fluent boundary.
+            extract = extract[: MAX_EXTRACT_CHARS + 1000].rsplit(".", 1)[0].strip() + "."
+            extract = extract[:MAX_EXTRACT_CHARS]
         page_title = parse_block.get("title") or title
         page_id = parse_block.get("pageid")
         url = self._title_to_url(page_title)
@@ -418,7 +543,79 @@ class StardewWikiIndex:
         )
         self.connection.commit()
 
+    # ------------------------------------------------- structured RAG (FTS5) ---
+
+    @staticmethod
+    def _fts_escape(term: str) -> str:
+        """Quote a term for FTS5 MATCH so hyphens/quotes never parse as syntax.
+
+        A bare ``stardew-era`` tokenises as ``stardew`` NEAR ``era`` and
+        embedded quotes can raise OperationalErrors. Double quotes are
+        doubled inside the quoted string per FTS5 string rules.
+        """
+        escaped = term.replace('"', '""')
+        return f'"{escaped}"'
+
+    def _search_clean(self, query: str, limit: int) -> list[WikiPassage]:
+        """Full-text search over the structured corpus (``stardew_page_clean``).
+
+        Returns [] when the corpus is empty or FTS5 is unavailable — callers
+        fall back to the legacy cache and remote search in that case.
+        """
+        terms = self._normalize_query(query)
+        if not terms:
+            return []
+        match_query = " OR ".join(self._fts_escape(term) for term in terms)
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT pc.title, pc.body_text, pc.url
+                FROM stardew_page_clean_fts fts
+                JOIN stardew_page_clean pc ON pc.rowid = fts.rowid
+                WHERE stardew_page_clean_fts MATCH ?
+                ORDER BY bm25(stardew_page_clean_fts)
+                LIMIT ?
+                """,
+                (match_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        term_set = set(terms)
+        passages: list[WikiPassage] = []
+        seen: set[str] = set()
+        for row in rows:
+            title_lower = row["title"].lower()
+            if title_lower in seen:
+                continue
+            seen.add(title_lower)
+            title_tokens = set(self._normalize_query(row["title"]))
+            # Prefer pages whose title matches the question (entity pages)
+            # over pages that merely mention the term in their body.
+            if term_set <= title_tokens:
+                score = 3.0
+            elif term_set & title_tokens:
+                score = 2.0
+            else:
+                score = 1.0
+            passages.append(
+                WikiPassage(
+                    title=row["title"],
+                    extract=row["body_text"] or "",
+                    url=row["url"],
+                    score=score,
+                )
+            )
+        passages.sort(key=lambda passage: (-passage.score, passage.title.lower()))
+        return passages[:limit]
+
     def search(self, query: str, limit: int = SEARCH_LIMIT) -> list[WikiPassage]:
+        # Local-first: the structured corpus (built by
+        # scripts/build_wiki_corpus.py) covers every game page, so prefer it
+        # and skip slow live HTTP round-trips whenever it can answer. The
+        # legacy cache + remote search remain the fallback for corpus gaps.
+        local_hits = self._search_clean(query, limit)
+        if local_hits:
+            return local_hits
         cached = self._search_cached(query, limit)
         try:
             remote_titles = self._search_remote_titles(query, limit)
@@ -500,26 +697,79 @@ class StardewWikiIndex:
             return [normalised] + tokens + [" ".join(tokens[-2:]), " ".join(tokens[-3:])]
         return [normalised]
 
+    def _entity_match_score(self, entity: StardewEntity, candidates: list[str]) -> int:
+        """Rank how strongly ``entity`` matches the question's candidate terms.
+
+        Exact canonical/display name beats alias beats substring. Prevents the
+        last-resort substring scan from promoting incidental matches (e.g. a
+        page that merely mentions the query word) over the real entity.
+        """
+        canonical = entity.canonical_name.lower()
+        display = entity.display_name.lower()
+        aliases = {alias.lower() for alias in entity.aliases}
+        best = 0
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            if candidate == canonical or candidate == display:
+                best = max(best, 4)
+            elif candidate in aliases:
+                best = max(best, 3)
+            elif candidate in display or candidate in canonical:
+                best = max(best, 2)
+        return best
+
     def lookup_entity(self, query: str) -> StardewEntity | None:
         """Best-effort structured lookup. Returns the highest-scoring row."""
         candidates = [candidate for candidate in self._candidate_terms(query) if candidate]
-        for candidate in candidates:
+
+        # Score every exact/alias match across ALL candidates instead of
+        # returning on the first hit. Question-leading tokens can be STT
+        # noise ("wheat can i fish bullhead" — Vosk misheard "where"), and
+        # first-hit order would let that token's entity shadow the real
+        # target mentioned later in the sentence. Later candidates get a
+        # small position bonus so trailing entity nouns win ties.
+        scored: dict[str, tuple[float, sqlite3.Row]] = {}
+
+        def consider(row: sqlite3.Row, base: float, index: int) -> None:
+            # Category pages ("Fish", "Crops", "Monsters", ...) share their
+            # name with their kind. They are hub pages, not the specific
+            # thing the user asked about — penalise them so "bullhead"
+            # outranks a later generic "fish" token even with the position
+            # bonus.
+            display_lower = row["display_name"].lower()
+            kind = row["kind"]
+            if kind and display_lower in (kind, kind + "s", kind + "es"):
+                base -= 25.0
+            score = base + index * 0.5
+            key = row["canonical_name"]
+            if key not in scored or scored[key][0] < score:
+                scored[key] = (score, row)
+
+        for index, candidate in enumerate(candidates):
+            term = candidate.strip().lower()
+            if not term:
+                continue
             row = self.connection.execute(
-                "SELECT * FROM stardew_entity WHERE canonical_name = ? OR display_name = ? LIMIT 1",
-                (candidate, candidate),
+                "SELECT * FROM stardew_entity WHERE lower(canonical_name) = ? "
+                "OR lower(display_name) = ? LIMIT 1",
+                (term, term),
             ).fetchone()
             if row:
-                return self._row_to_entity(row)
-
-        # Alias match (JSON LIKE). Cheap fall-through that still beats LLM guessing.
-        for candidate in candidates:
-            pattern = f'%"{candidate.lower()}"%'
+                consider(row, 100.0, index)
+                continue
+            pattern = f'%"{term}"%'
             row = self.connection.execute(
                 "SELECT * FROM stardew_entity WHERE lower(aliases) LIKE ? LIMIT 1",
                 (pattern,),
             ).fetchone()
             if row:
-                return self._row_to_entity(row)
+                consider(row, 80.0, index)
+
+        if scored:
+            best = max(scored.values(), key=lambda pair: pair[0])
+            return self._row_to_entity(best[1])
 
         # FTS5 search if present, with structured LIKE as fallback.
         try:
@@ -537,6 +787,11 @@ class StardewWikiIndex:
 
         last = candidates[-1] if candidates else query
         if last:
+            # Fuzzy: catch STT slips like 'bullhed' → 'bullhead'. Try exact,
+            # prefix, substring, then a bounded Levenshtein scan (1 edit for
+            # ≤4 chars, 2 for ≤7, 3 beyond — matching the STT corrector's
+            # tiered thresholds). Keeps typos fixable without opening the
+            # 2-edit door to unrelated short words.
             like = f"%{last.lower()}%"
             rows = self.connection.execute(
                 "SELECT * FROM stardew_entity WHERE lower(display_name) LIKE ? "
@@ -548,8 +803,43 @@ class StardewWikiIndex:
             if rows:
                 return self._row_to_entity(rows[0])
 
-            # Last resort: scan attributes JSON. Rank by token overlap count.
+            try:
+                from ._transcribe_distance import levenshtein
+            except ImportError:  # pragma: no cover - helper always ships
+                def levenshtein(a: str, b: str) -> int:
+                    if a == b:
+                        return 0
+                    if not a:
+                        return len(b)
+                    if not b:
+                        return len(a)
+                    prev = list(range(len(b) + 1))
+                    for i, ca in enumerate(a, 1):
+                        current = [i]
+                        for j, cb in enumerate(b, 1):
+                            current.append(min(current[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+                        prev = current
+                    return prev[-1]
+
+            len_lower = len(last)
+            max_distance = 1 if len_lower <= 4 else (2 if len_lower <= 7 else 3)
             best_row: sqlite3.Row | None = None
+            best_distance = max_distance + 1
+            for row in self.connection.execute("SELECT * FROM stardew_entity").fetchall():
+                display = row["display_name"].lower()
+                if abs(len(display) - len_lower) > max_distance:
+                    continue
+                distance = levenshtein(last.lower(), display)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_row = row
+                    if distance == 0:
+                        break
+            if best_row is not None and best_distance <= max_distance:
+                return self._row_to_entity(best_row)
+
+            # Last resort: scan attributes JSON. Rank by token overlap count.
+            best_row = None
             best_score = 0
             query_token_set = set(self._normalize_query(query))
             for row in self.connection.execute(
@@ -616,36 +906,112 @@ class StardewWikiIndex:
                     return list(entities.values())[:limit]
         return list(entities.values())[:limit]
 
+    # Spoken-answer composition. Every field not listed here is dropped:
+    # raw wiki fields like "Fishing XP", "Size (inches)", "Recipe", or
+    # "Healing" produced word-salad answers when an infobox was read aloud.
+    _COMPACT_FIELDS: tuple[str, ...] = (
+        "Location", "Season", "Time", "Weather", "Growth Time", "Regrowth",
+        "Sell Price", "Seed Price", "Lives In", "Address", "Birthday",
+        "Marriage", "Best Gifts", "Loved Gifts",
+    )
+    # Natural spoken templates per field. Kind-specific overrides below
+    # reword fields whose generic phrasing would sound wrong (fish are
+    # "caught", crops "grow").
+    _FIELD_TEMPLATES: dict[str, str] = {
+        "Location": "is found in {value}",
+        "Season": "grows in {value}",
+        "Time": "is active {value}",
+        "Weather": "in {value} weather",
+        "Growth Time": "takes {value} to grow",
+        "Regrowth": "regrows in {value}",
+        "Sell Price": "sells for {value}",
+        "Seed Price": "seeds cost {value}",
+        "Lives In": "lives in {value}",
+        "Address": "can be found at {value}",
+        "Birthday": "has a birthday on {value}",
+        "Marriage": "is marriageable",
+        "Best Gifts": "loves {value}",
+        "Loved Gifts": "loves {value}",
+    }
+    _FISH_FIELD_TEMPLATES: dict[str, str] = {
+        "Location": "can be caught at {value}",
+        "Season": "can be caught in {value}",
+    }
+
     @staticmethod
-    def compose_answer(entity: StardewEntity, query: str) -> str:
-        """Build a deterministic, dangerously-correct answer from the infobox."""
+    def _spoken_value(key: str, value: str) -> str:
+        """Normalise wiki shorthand and separators so values stay intelligible
+        when spoken (and never carry control characters into TTS)."""
+        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f\ufffd]", " ", value)
+        # Typographic separators: bullets become "and", time ranges read
+        # "6am to 8pm" instead of an unpronounceable dash.
+        value = value.replace("\u2022", "and").replace("\u2013", " to ").replace("\u2014", " to ")
+        value = " ".join(value.split())
+        lowered = value.lower()
+        if key == "Season" and lowered in ("all", "any"):
+            return "all seasons"
+        if key == "Time" and lowered == "any":
+            return "at any time"
+        if key == "Weather" and lowered == "any":
+            return "any weather"
+        return value
+
+    @classmethod
+    def compose_answer(cls, entity: StardewEntity, query: str) -> str:
+        """Build a deterministic, spoken-style answer from the infobox.
+
+        Previously this read up to six raw infobox fields aloud in
+        ``Key: value; Key: value`` form, producing word salad like
+        ``Fishing XP: 18 21 24; Size (inches): 12-31``. Now: pick intent-
+        relevant fields from a compact whitelist, render them through
+        natural-language templates, and join into one flowing sentence that
+        stays inside the TTS comfort zone.
+        """
         q_lower = query.lower()
-        # Pull fields relevant to the question's intent.
-        fields = list(entity.attributes.items())
-        priority_keys: list[str] = []
+        # Fields relevant to the question's intent come first.
+        priority: list[str] = []
         for intent, keys in INTENT_FIELDS.items():
             if intent in q_lower:
-                priority_keys.extend(keys)
+                priority.extend(key for key in keys if key not in priority)
                 break
-        # Always start with the most relevant fields to the intent.
-        priority_keys.extend([key for key, _ in fields if key not in priority_keys])
-        # Cap emitted attributes to keep spoken answers short.
-        parts: list[str] = []
-        for key in priority_keys:
-            value = entity.get(key)
-            if not value:
-                continue
-            formatted_key = key.replace("_", " ").strip()
-            parts.append(f"{formatted_key}: {value}")
-            if len(parts) >= 6:
-                break
-        if not parts:
-            return f"{entity.display_name} is in the wiki, but I do not have a structured field for that question."
+        priority.extend(
+            key for key in cls._COMPACT_FIELDS if key not in priority
+        )
 
-        head = f"{entity.display_name}"
-        if entity.aliases:
-            head += f" (a.k.a. {', '.join(entity.aliases[:2])})"
-        return f"{head}. " + "; ".join(parts) + "."
+        templates = dict(cls._FIELD_TEMPLATES)
+        if entity.kind == "fish":
+            templates.update(cls._FISH_FIELD_TEMPLATES)
+
+        phrases: list[str] = []
+        total = len(entity.display_name) + 12
+        for key in priority:
+            raw = entity.get(key)
+            if not raw:
+                continue
+            if key == "Marriage" and raw.strip().lower() in ("no", "false"):
+                continue
+            value = cls._spoken_value(key, raw)
+            # Gift lists read terribly in full — keep the head of the list.
+            if key in ("Best Gifts", "Loved Gifts") and len(value) > 60:
+                value = value[:60].rsplit(" ", 1)[0].rstrip(",") + ", and more"
+            phrase = templates.get(key, key.lower()).format(value=value)
+            if len(phrase) > 110:
+                continue
+            phrases.append(phrase)
+            total += len(phrase) + 3
+            if total >= 240 or len(phrases) >= 3:
+                break
+        if not phrases:
+            return (
+                f"{entity.display_name} is in the wiki, but I do not have a "
+                "structured field for that question."
+            )
+        head = f"{entity.display_name} {phrases[0]}"
+        if len(phrases) == 1:
+            return head + "."
+        if len(phrases) == 2:
+            return f"{head} and {phrases[1]}."
+        return f"{head}, " + ", ".join(phrases[1:-1]) + f", and {phrases[-1]}."
 
     def get_vocabulary(self) -> set[str]:
         """Return every Stardew vocabulary word (lowercase) for STT correction."""
